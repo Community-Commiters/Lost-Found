@@ -1,9 +1,0 @@
-{
-  "compilerOptions": {
-    "rootDir": "src",
-    "outDir": "dist",
-    "module": "CommonJS",
-    "target": "ES2024",
-    "esModuleInterop": true
-  }
-}
