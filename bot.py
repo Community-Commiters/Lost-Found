@@ -1,8 +1,10 @@
 """University Lost & Found Telegram bot.
 
 Users report FOUND or LOST items through a short step-by-step conversation.
-The report is published to a channel, and people can respond privately through
-the bot. The poster must approve before any contact details are shared.
+Every report is reviewed by a moderator, then published to the channel
+between 09:00 and 22:00 (reports submitted outside that window appear the
+next morning). People respond privately through the bot, and the poster must
+approve before any contact details are shared.
 """
 
 from __future__ import annotations
@@ -12,9 +14,10 @@ import os
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from enum import Enum
-from typing import Iterator, NamedTuple, Optional, Sequence
+from typing import FrozenSet, Iterator, NamedTuple, Optional, Sequence
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from dotenv import load_dotenv
 from telegram import (
@@ -49,9 +52,42 @@ def require_env(name: str) -> str:
     return value
 
 
+def parse_user_ids(name: str) -> FrozenSet[int]:
+    """Read a comma-separated list of Telegram user IDs from .env."""
+    ids = set()
+    for part in (os.getenv(name) or "").replace(";", ",").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            ids.add(int(part))
+        except ValueError:
+            raise RuntimeError(f"{name} contains an invalid Telegram user ID: {part!r}")
+    return frozenset(ids)
+
+
 BOT_TOKEN = require_env("BOT_TOKEN")
 CHANNEL_ID = require_env("CHANNEL_ID")
-ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID") or 0) or None
+
+# Moderators review every report before it is published.
+# ADMIN_USER_IDS=111,222 sets several; the old single ADMIN_USER_ID still works.
+MODERATOR_IDS = parse_user_ids("ADMIN_USER_IDS") | parse_user_ids("ADMIN_USER_ID")
+
+# Publishing schedule (NFR-01): reports submitted between 09:00 and 22:00
+# must appear within two hours; reports submitted outside the window appear
+# the next day from 09:00.
+try:
+    TIMEZONE = ZoneInfo(os.getenv("TIMEZONE", "Asia/Tashkent"))
+except ZoneInfoNotFoundError:
+    raise RuntimeError(
+        "Time zone data is missing. Run: python -m pip install -r requirements.txt "
+        "(it installs tzdata, which Windows needs)."
+    )
+PUBLISH_START_HOUR = int(os.getenv("PUBLISH_START_HOUR", "9"))
+PUBLISH_END_HOUR = int(os.getenv("PUBLISH_END_HOUR", "22"))
+PUBLISH_DEADLINE = timedelta(hours=2)
+REVIEW_REMINDER_BEFORE = timedelta(minutes=30)  # Nudge moderators before the deadline.
+SCHEDULER_INTERVAL_SECONDS = 60
 
 DATABASE_FILE = "lost_found.db"
 
@@ -74,10 +110,17 @@ logger = logging.getLogger(__name__)
 KIND_FOUND = "FOUND"
 KIND_LOST = "LOST"
 
-# Report statuses
+# Report statuses:
+# pending_review -> scheduled -> publishing -> posted
+#        |                          |
+#        v                          v
+#     rejected                    failed --(moderator Retry)--> scheduled
+REPORT_PENDING_REVIEW = "pending_review"
+REPORT_SCHEDULED = "scheduled"
 REPORT_PUBLISHING = "publishing"
 REPORT_POSTED = "posted"
 REPORT_FAILED = "failed"
+REPORT_REJECTED = "rejected"
 
 # Claim types (what the responder wants to do)
 CLAIM_GOT_ITEM = "got_item"
@@ -93,6 +136,7 @@ CLAIM_NOTIFICATION_FAILED = "notification_failed"
 # Keys in context.user_data
 FLOW_KEY = "report_flow"
 CLAIM_KEY = "pending_claim"
+REJECT_KEY = "rejecting_report"  # A moderator is typing a rejection reason.
 
 # Reply-keyboard buttons
 FOUND_BUTTON = "🕵🏻 FOUND"
@@ -109,6 +153,12 @@ CB_CLAIM = "claim"
 CB_LOST_RESPONSE = "lost_response"
 CB_CLAIM_CHOICE = "claim_choice"
 CB_CLAIM_DECISION = "claim_decision"
+CB_MODERATE = "mod"  # mod:<approve|reject|retry>:<report id>
+
+# Moderator actions
+MOD_APPROVE = "approve"
+MOD_REJECT = "reject"
+MOD_RETRY = "retry"
 
 # Contact choices
 CONTACT_TELEGRAM = "telegram"
@@ -176,6 +226,7 @@ class Step(Enum):
     CONTACT_FALLBACK = "contact_fallback"
     PHONE = "phone"
     PREVIEW = "preview"
+    SUBMITTING = "submitting"  # Guards against a double tap on Submit.
 
 
 # Step numbers shown to the user ("Step 2 of 6"), per report kind.
@@ -240,6 +291,7 @@ def get_flow(context: ContextTypes.DEFAULT_TYPE) -> Optional[ReportFlow]:
 def clear_session(context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data.pop(FLOW_KEY, None)
     context.user_data.pop(CLAIM_KEY, None)
+    context.user_data.pop(REJECT_KEY, None)
 
 
 def step_label(flow: ReportFlow, step: Step) -> str:
@@ -249,6 +301,61 @@ def step_label(flow: ReportFlow, step: Step) -> str:
 
 def telegram_username(user) -> Optional[str]:
     return f"@{user.username}" if user.username else None
+
+
+# ---------------------------------------------------------
+# Publishing schedule
+# ---------------------------------------------------------
+
+
+def now_local() -> datetime:
+    return datetime.now(TIMEZONE)
+
+
+def is_within_publish_hours(moment: Optional[datetime] = None) -> bool:
+    moment = moment or now_local()
+    return PUBLISH_START_HOUR <= moment.hour < PUBLISH_END_HOUR
+
+
+def compute_publish_after(moment: Optional[datetime] = None) -> datetime:
+    """The moment itself inside the window, otherwise the next window start."""
+    moment = (moment or now_local()).astimezone(TIMEZONE)
+    if is_within_publish_hours(moment):
+        return moment
+
+    window_start = moment.replace(
+        hour=PUBLISH_START_HOUR, minute=0, second=0, microsecond=0
+    )
+    if moment.hour < PUBLISH_START_HOUR:
+        return window_start
+    return window_start + timedelta(days=1)
+
+
+def to_db_time(moment: datetime) -> str:
+    """Store times in UTC so that string comparison in SQL is always correct."""
+    return moment.astimezone(timezone.utc).isoformat(timespec="seconds")
+
+
+def from_db_time(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        moment = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return moment
+
+
+def format_local(moment: Optional[datetime]) -> str:
+    if moment is None:
+        return "unknown"
+    return moment.astimezone(TIMEZONE).strftime("%d.%m.%Y %H:%M")
+
+
+def publish_window_text() -> str:
+    return f"{PUBLISH_START_HOUR:02d}:00–{PUBLISH_END_HOUR:02d}:00"
 
 
 # ---------------------------------------------------------
@@ -307,6 +414,12 @@ REPORT_MIGRATIONS = {
     "status": "TEXT NOT NULL DEFAULT 'publishing'",
     "channel_message_id": "INTEGER",
     "kind": "TEXT NOT NULL DEFAULT 'FOUND'",
+    # Moderation and publishing schedule.
+    "publish_after": "TEXT",  # UTC; earliest publish time, set on submission
+    "moderated_by": "INTEGER",
+    "moderated_at": "TEXT",
+    "reject_reason": "TEXT",
+    "review_reminded_at": "TEXT",
 }
 CLAIM_MIGRATIONS = {
     "claim_type": "TEXT NOT NULL DEFAULT 'contact_poster'",
@@ -411,7 +524,9 @@ def build_report_values(flow: ReportFlow, user, created_at: str) -> dict:
         "contact_type": flow.contact_type or CONTACT_BOT,
         "contact_value": flow.contact_value,
         "created_at": created_at,
-        "status": REPORT_PUBLISHING,
+        # Nothing is published until a moderator approves it.
+        "status": REPORT_PENDING_REVIEW,
+        "publish_after": to_db_time(compute_publish_after()),
         "channel_message_id": None,
     }
 
@@ -444,6 +559,34 @@ def save_claim(report_id: int, claimant, detail: str, claim_type: str) -> int:
     }
     with db_session() as db:
         return insert_row(db, "claims", values)
+
+
+def fetch_report(report_id: int) -> Optional[sqlite3.Row]:
+    with db_session() as db:
+        return db.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
+
+
+def fetch_report_ids(where: str, parameters: tuple = ()) -> list:
+    with db_session() as db:
+        rows = db.execute(f"SELECT id FROM reports WHERE {where}", parameters)
+        return [row["id"] for row in rows]
+
+
+def change_report_status(
+    report_id: int, from_status: str, to_status: str, **fields
+) -> bool:
+    """Move a report between statuses atomically.
+
+    Succeeds only if the report is still in `from_status`, so two moderators
+    (or a moderator and the scheduler) can never apply the same step twice.
+    """
+    assignments = ", ".join(["status = ?"] + [f"{name} = ?" for name in fields])
+    with db_session() as db:
+        cursor = db.execute(
+            f"UPDATE reports SET {assignments} WHERE id = ? AND status = ?",
+            (to_status, *fields.values(), report_id, from_status),
+        )
+        return cursor.rowcount == 1
 
 
 def fetch_posted_report(report_id: int) -> Optional[sqlite3.Row]:
@@ -572,7 +715,22 @@ def contact_fallback_keyboard() -> InlineKeyboardMarkup:
 
 
 def preview_keyboard() -> InlineKeyboardMarkup:
-    return inline_keyboard([button("Publish announcement", CB_PUBLISH)], cancel_row())
+    return inline_keyboard([button("Submit for review", CB_PUBLISH)], cancel_row())
+
+
+def moderation_keyboard(report_id: int) -> InlineKeyboardMarkup:
+    return inline_keyboard(
+        [
+            button("✅ Approve", f"{CB_MODERATE}:{MOD_APPROVE}:{report_id}"),
+            button("❌ Reject", f"{CB_MODERATE}:{MOD_REJECT}:{report_id}"),
+        ]
+    )
+
+
+def retry_keyboard(report_id: int) -> InlineKeyboardMarkup:
+    return inline_keyboard(
+        [button("🔁 Retry publishing", f"{CB_MODERATE}:{MOD_RETRY}:{report_id}")]
+    )
 
 
 def claim_keyboard(report_id: int) -> InlineKeyboardMarkup:
@@ -659,9 +817,14 @@ def format_contact(flow: ReportFlow) -> str:
     return "Use the “I think this is mine” button below."
 
 
-def make_announcement(flow: ReportFlow) -> str:
+def make_announcement(flow: ReportFlow, reported_at: Optional[str] = None) -> str:
+    """Build the channel post. `reported_at` is the saved created_at value;
+    without it (the preview) the current time is shown."""
     photo_line = "📷 Photo: Attached\n" if flow.photo_file_id else ""
-    reported = datetime.now().strftime("%Y-%m-%d %H:%M")
+    if reported_at:
+        reported = str(reported_at)[:16].replace("T", " ")
+    else:
+        reported = datetime.now().strftime("%Y-%m-%d %H:%M")
     item = flow.description.strip()
     place = format_place(flow)
     contact = format_contact(flow)
@@ -771,8 +934,12 @@ async def prompt_contact(chat_id, context, flow: ReportFlow) -> None:
 async def show_preview(chat_id, context, flow: ReportFlow) -> None:
     text = (
         f"{step_label(flow, Step.PREVIEW)} — Preview your {flow.kind} announcement\n\n"
-        "Please check the details before publishing.\n\n"
-        f"{make_announcement(flow)}"
+        "Please check the details before submitting.\n\n"
+        f"{make_announcement(flow)}\n\n"
+        "———\n"
+        "A moderator reviews every report before it is posted. Reports are "
+        f"published between {publish_window_text()}; reports submitted later "
+        "appear the next morning."
     )
     await send_prompt(context, chat_id, flow, Step.PREVIEW, text, preview_keyboard())
 
@@ -965,6 +1132,11 @@ TEXT_STEP_HANDLERS = {
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
     text = (message.text or "").strip()
+
+    # A moderator typing the reason for a rejection comes first.
+    if context.user_data.get(REJECT_KEY):
+        await receive_reject_reason(update, context)
+        return
 
     # A claim's identifying details are handled before anything else.
     if context.user_data.get(CLAIM_KEY):
@@ -1162,66 +1334,444 @@ async def post_to_channel(
 
 
 async def on_publish(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Submit the report for moderation. Nothing reaches the channel yet."""
     query = update.callback_query
     await query.answer()
 
     flow = get_flow(context)
     if not flow or flow.step != Step.PREVIEW:
         await query.message.reply_text(
-            "There is no ready-to-publish report. Please start again with /found or /lost."
+            "There is no ready-to-submit report. Please start again with /found or /lost."
         )
         return
 
-    # Save first so the channel button has a report id to point at.
+    # A second tap while saving must not create a second report (NFR-05).
+    flow.step = Step.SUBMITTING
+
     created_at = datetime.now().isoformat(timespec="seconds")
     try:
         report_id = save_report(flow, query.from_user, created_at)
     except sqlite3.Error as error:
+        flow.step = Step.PREVIEW
         logger.exception("Database error while saving %s report", flow.kind)
         await query.message.reply_text(
-            "I couldn't save this report to the database, so it was not published. "
-            "Your answers are still in this chat; please try Publish again.\n\n"
+            "I couldn't save this report to the database. "
+            "Your answers are still in this chat; please try Submit again.\n\n"
             f"Database error: {error}"
         )
         return
 
-    announcement = make_announcement(flow)
+    context.user_data.pop(FLOW_KEY, None)
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except TelegramError:
+        pass  # The buttons were already removed; nothing to do.
+
+    if not MODERATOR_IDS:
+        # No moderators configured: skip review, keep the schedule.
+        await query.message.reply_text(
+            f"Your {flow.kind} report #{report_id} has been accepted.",
+            reply_markup=main_keyboard(),
+        )
+        await approve_report(context, report_id, moderator_id=None)
+        return
+
+    await query.message.reply_text(
+        f"✅ Your {flow.kind} report #{report_id} was sent to the moderators for review.\n\n"
+        f"Approved reports are published between {publish_window_text()}; "
+        "reports submitted later appear the next morning. "
+        "I'll message you when it is published.\n\n"
+        "Choose FOUND or LOST below if you want to make another report.",
+        reply_markup=main_keyboard(),
+    )
+    await send_review_request(context, report_id)
+
+
+# ---------------------------------------------------------
+# Moderation: review queue
+# ---------------------------------------------------------
+
+
+def is_moderator(user) -> bool:
+    return user is not None and user.id in MODERATOR_IDS
+
+
+def flow_from_report(report: sqlite3.Row) -> ReportFlow:
+    """Rebuild the report answers from the database, to format the post later."""
+    return ReportFlow(
+        kind=report_kind(report),
+        step=Step.PREVIEW,
+        user_id=report["user_id"],
+        username=report["username"],
+        photo_file_id=report["photo_file_id"],
+        description=report["description"] or "",
+        found_place=report["found_place"] or "",
+        found_detail=report["found_detail"] or "",
+        handoff=report["handoff"] or "",
+        handoff_detail=report["handoff_detail"] or "",
+        contact_type=report["contact_type"] or "",
+        contact_value=report["contact_value"],
+    )
+
+
+def build_announcement(report: sqlite3.Row) -> str:
+    announcement = make_announcement(flow_from_report(report), report["created_at"])
     if len(announcement) > MAX_ANNOUNCEMENT_LENGTH:
         announcement = announcement[:3980].rstrip() + "\n…(announcement shortened)"
+    return announcement
 
+
+def publish_deadline(report: sqlite3.Row) -> Optional[datetime]:
+    """NFR-01: published within two hours of the earliest publish time."""
+    earliest = from_db_time(report["publish_after"])
+    return earliest + PUBLISH_DEADLINE if earliest else None
+
+
+def planned_publish_time(report: sqlite3.Row) -> datetime:
+    """When the report would go out if it were approved right now."""
+    earliest = from_db_time(report["publish_after"]) or now_local()
+    return compute_publish_after(max(earliest, now_local()))
+
+
+def make_review_text(report: sqlite3.Row) -> str:
+    kind = report_kind(report)
+    reporter = report["username"] or "no username"
+    planned = planned_publish_time(report)
+    if planned <= now_local():
+        when = "If approved now, it is published immediately."
+    else:
+        when = f"If approved now, it is published at {format_local(planned)}."
+
+    return (
+        f"🛡 #{kind} report #{report['id']} — waiting for review\n"
+        f"From: {reporter} (ID {report['user_id']})\n"
+        f"Publish by: {format_local(publish_deadline(report))} (2-hour rule)\n\n"
+        "Channel post will look like this:\n"
+        "———\n"
+        f"{build_announcement(report)}\n"
+        "———\n"
+        f"{when}"
+    )
+
+
+async def notify_moderators(context, text: str, reply_markup=None) -> None:
+    for moderator_id in MODERATOR_IDS:
+        try:
+            await context.bot.send_message(
+                chat_id=moderator_id, text=text, reply_markup=reply_markup
+            )
+        except TelegramError:
+            logger.warning(
+                "Could not message moderator %s. They must open the bot and "
+                "press Start once.",
+                moderator_id,
+            )
+
+
+async def send_review_request(
+    context, report_id: int, moderator_ids: Optional[Sequence[int]] = None
+) -> None:
+    """Send a pending report with Approve / Reject buttons to moderators."""
+    report = fetch_report(report_id)
+    if not report:
+        return
+
+    text = make_review_text(report)
+    keyboard = moderation_keyboard(report_id)
+    photo = report["photo_file_id"]
+
+    for moderator_id in moderator_ids or MODERATOR_IDS:
+        try:
+            if photo and len(text) <= MAX_CAPTION_LENGTH:
+                await context.bot.send_photo(
+                    chat_id=moderator_id, photo=photo, caption=text,
+                    reply_markup=keyboard,
+                )
+                continue
+            if photo:
+                await context.bot.send_photo(chat_id=moderator_id, photo=photo)
+            await context.bot.send_message(
+                chat_id=moderator_id, text=text, reply_markup=keyboard
+            )
+        except TelegramError:
+            logger.warning(
+                "Could not send report %s to moderator %s. They must open the "
+                "bot and press Start once.",
+                report_id,
+                moderator_id,
+            )
+
+
+async def approve_report(
+    context, report_id: int, moderator_id: Optional[int]
+) -> Optional[datetime]:
+    """Approve a pending report and schedule it.
+
+    Returns the publish time, or None if the report was no longer pending
+    (for example, another moderator handled it first).
+    """
+    report = fetch_report(report_id)
+    if not report:
+        return None
+
+    publish_at = planned_publish_time(report)
+    approved = change_report_status(
+        report_id,
+        REPORT_PENDING_REVIEW,
+        REPORT_SCHEDULED,
+        publish_after=to_db_time(publish_at),
+        moderated_by=moderator_id,
+        moderated_at=to_db_time(now_local()),
+    )
+    if not approved:
+        return None
+
+    if publish_at <= now_local():
+        await publish_report(context, report_id)
+    else:
+        await safe_send_message(
+            context,
+            report["user_id"],
+            f"Your #{report_kind(report)} report #{report_id} was approved. "
+            f"It will be published in the channel at {format_local(publish_at)}.",
+        )
+    return publish_at
+
+
+async def remove_buttons(query) -> None:
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except TelegramError:
+        pass  # The buttons were already removed; nothing to do.
+
+
+async def on_moderation_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """A moderator presses Approve, Reject or Retry."""
+    query = update.callback_query
+    moderator = query.from_user
+    action = context.match.group(1)
+    report_id = int(context.match.group(2))
+
+    if not is_moderator(moderator):
+        await query.answer("Only moderators can do this.", show_alert=True)
+        return
+
+    moderator_name = telegram_username(moderator) or str(moderator.id)
+
+    if action == MOD_APPROVE:
+        publish_at = await approve_report(context, report_id, moderator.id)
+        await remove_buttons(query)
+        if publish_at is None:
+            report = fetch_report(report_id)
+            status = report["status"] if report else "deleted"
+            await query.answer(
+                f"Report #{report_id} was already handled ({status}).", show_alert=True
+            )
+            return
+
+        await query.answer("Approved.")
+        report = fetch_report(report_id)
+        if report["status"] == REPORT_POSTED:
+            outcome = "published to the channel now"
+        elif report["status"] == REPORT_FAILED:
+            outcome = "approved, but publishing failed (see the message below)"
+        else:
+            outcome = f"scheduled for {format_local(publish_at)}"
+        await query.message.reply_text(
+            f"✅ Report #{report_id} approved by {moderator_name}: {outcome}."
+        )
+        return
+
+    if action == MOD_REJECT:
+        report = fetch_report(report_id)
+        if not report or report["status"] != REPORT_PENDING_REVIEW:
+            await remove_buttons(query)
+            await query.answer(f"Report #{report_id} was already handled.", show_alert=True)
+            return
+
+        context.user_data[REJECT_KEY] = report_id
+        await query.answer()
+        await query.message.reply_text(
+            f"Send the reason for rejecting report #{report_id}. "
+            "The reporter will see it.\n\n"
+            "Send - to reject without a reason, or /cancel to keep the report pending."
+        )
+        return
+
+    # MOD_RETRY: publish a failed report again, right away.
+    retried = change_report_status(
+        report_id, REPORT_FAILED, REPORT_SCHEDULED,
+        publish_after=to_db_time(now_local()),
+    )
+    await remove_buttons(query)
+    if not retried:
+        await query.answer("This report is not waiting for a retry.", show_alert=True)
+        return
+
+    await query.answer("Retrying…")
+    published = await publish_report(context, report_id)
+    await query.message.reply_text(
+        f"Report #{report_id} published."
+        if published
+        else f"Report #{report_id} still could not be published."
+    )
+
+
+async def receive_reject_reason(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.effective_message
+    moderator = update.effective_user
+    report_id = context.user_data.pop(REJECT_KEY, None)
+    if not report_id or not is_moderator(moderator):
+        return
+
+    reason = (message.text or "").strip()
+    if reason in {"", "-"}:
+        reason = None
+
+    rejected = change_report_status(
+        report_id,
+        REPORT_PENDING_REVIEW,
+        REPORT_REJECTED,
+        moderated_by=moderator.id,
+        moderated_at=to_db_time(now_local()),
+        reject_reason=reason,
+    )
+    if not rejected:
+        await message.reply_text(f"Report #{report_id} was already handled by someone else.")
+        return
+
+    await message.reply_text(f"❌ Report #{report_id} rejected.")
+
+    report = fetch_report(report_id)
+    if report:
+        text = (
+            f"Your #{report_kind(report)} report #{report_id} was not approved "
+            "by the moderators."
+        )
+        if reason:
+            text += f"\n\nReason: {reason}"
+        text += "\n\nYou can submit a corrected report with FOUND or LOST."
+        await safe_send_message(context, report["user_id"], text)
+
+
+async def pending_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/pending (moderators): reports waiting for review, scheduled or failed."""
+    user = update.effective_user
+    message = update.effective_message
+    if not is_moderator(user):
+        await message.reply_text("This command is for moderators only.")
+        return
+
+    pending = fetch_report_ids(
+        "status = ? ORDER BY id", (REPORT_PENDING_REVIEW,)
+    )
+    scheduled = fetch_report_ids(
+        "status = ? ORDER BY publish_after, id", (REPORT_SCHEDULED,)
+    )
+    failed = fetch_report_ids("status = ? ORDER BY id", (REPORT_FAILED,))
+
+    lines = [f"🛡 Waiting for review: {len(pending)}"]
+    if scheduled:
+        lines.append(f"⏰ Scheduled: {len(scheduled)}")
+        for report_id in scheduled:
+            report = fetch_report(report_id)
+            lines.append(
+                f"  • #{report_id} at {format_local(from_db_time(report['publish_after']))}"
+            )
+    if failed:
+        lines.append(f"⚠️ Failed to publish: {len(failed)}")
+    await message.reply_text("\n".join(lines))
+
+    for report_id in pending:
+        await send_review_request(context, report_id, moderator_ids=[user.id])
+    for report_id in failed:
+        await message.reply_text(
+            f"Report #{report_id} could not be published.",
+            reply_markup=retry_keyboard(report_id),
+        )
+
+
+# ---------------------------------------------------------
+# Publishing (on approval, or from the scheduler)
+# ---------------------------------------------------------
+
+
+async def publish_report(context, report_id: int) -> bool:
+    """Post one scheduled report to the channel. Returns True on success."""
+    # Lock the report first so it can never be posted twice.
+    if not change_report_status(report_id, REPORT_SCHEDULED, REPORT_PUBLISHING):
+        return False
+
+    report = fetch_report(report_id)
+    flow = flow_from_report(report)
     keyboard = (
         lost_response_keyboard(report_id) if flow.is_lost else claim_keyboard(report_id)
     )
 
     try:
-        channel_message_id = await post_to_channel(context, flow, announcement, keyboard)
-    except TelegramError as error:
-        logger.exception("Could not publish %s announcement", flow.kind)
-        update_report_status(report_id, REPORT_FAILED)
-        await query.message.reply_text(
-            "I saved your report, but Telegram couldn't publish it to the channel. "
-            "Please check that the bot is an administrator with permission to post. "
-            "Your answers have been kept; you can try publishing again.\n\n"
-            f"Telegram error: {error}"
+        channel_message_id = await post_to_channel(
+            context, flow, build_announcement(report), keyboard
         )
-        return
+    except TelegramError as error:
+        logger.exception("Could not publish report %s", report_id)
+        update_report_status(report_id, REPORT_FAILED)
+        await notify_moderators(
+            context,
+            f"⚠️ Report #{report_id} was approved but could not be posted. "
+            "Check that the bot is a channel administrator with permission "
+            f"to post.\n\nTelegram error: {error}",
+            reply_markup=retry_keyboard(report_id),
+        )
+        return False
 
     # The post is live, so a failure here must not be reported as a failed publish.
     update_report_status(report_id, REPORT_POSTED, channel_message_id)
-    context.user_data.pop(FLOW_KEY, None)
-
-    await query.message.reply_text(
-        f"Your {flow.kind} announcement has been published successfully.\n\n"
-        "Choose FOUND or LOST below if you want to make another report.",
-        reply_markup=main_keyboard(),
+    await safe_send_message(
+        context,
+        report["user_id"],
+        f"📢 Your #{flow.kind} report #{report_id} is now published in the channel.",
     )
+    return True
 
-    if ADMIN_USER_ID:
-        await safe_send_message(
+
+async def remind_moderators(context) -> None:
+    """Nudge moderators about reports close to their two-hour deadline."""
+    now = now_local()
+    for report_id in fetch_report_ids(
+        "status = ? AND review_reminded_at IS NULL ORDER BY id",
+        (REPORT_PENDING_REVIEW,),
+    ):
+        report = fetch_report(report_id)
+        deadline = publish_deadline(report)
+        if deadline is None or deadline - now > REVIEW_REMINDER_BEFORE:
+            continue
+
+        with db_session() as db:
+            db.execute(
+                "UPDATE reports SET review_reminded_at = ? WHERE id = ?",
+                (to_db_time(now), report_id),
+            )
+        await notify_moderators(
             context,
-            ADMIN_USER_ID,
-            f"New #{flow.kind} report published. Report ID: {report_id}",
+            f"⏰ Report #{report_id} is still waiting for review. It must be "
+            f"published by {format_local(deadline)}. Use /pending to see it.",
         )
+
+
+async def run_schedule(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Scheduler job, every minute: publish due reports, send reminders."""
+    if not is_within_publish_hours():
+        return
+
+    due = fetch_report_ids(
+        "status = ? AND publish_after <= ? ORDER BY publish_after, id",
+        (REPORT_SCHEDULED, to_db_time(now_local())),
+    )
+    for report_id in due:
+        await publish_report(context, report_id)
+
+    if MODERATOR_IDS:
+        await remind_moderators(context)
 
 
 # ---------------------------------------------------------
@@ -1453,13 +2003,11 @@ async def receive_claim_detail(update: Update, context: ContextTypes.DEFAULT_TYP
         context, report, claim_id, claimant, pending.claim_type, detail
     )
 
-    if ADMIN_USER_ID:
-        await safe_send_message(
-            context,
-            ADMIN_USER_ID,
-            f"New claim #{claim_id} for report #{pending.report_id}.\n"
-            f"Claimant ID: {claimant.id}\nDetails: {detail}",
-        )
+    await notify_moderators(
+        context,
+        f"New claim #{claim_id} for report #{pending.report_id}.\n"
+        f"Claimant ID: {claimant.id}\nDetails: {detail}",
+    )
 
 
 def build_contact_label(report: sqlite3.Row) -> str:
@@ -1565,6 +2113,10 @@ CALLBACK_ROUTES = [
         on_claim_choice,
     ),
     (rf"^{CB_CLAIM_DECISION}:(\d+):(approve|decline)$", on_claim_decision),
+    (
+        rf"^{CB_MODERATE}:({MOD_APPROVE}|{MOD_REJECT}|{MOD_RETRY}):(\d+)$",
+        on_moderation_button,
+    ),
 ]
 
 
@@ -1577,6 +2129,7 @@ def main() -> None:
     app.add_handler(CommandHandler("found", start_found))
     app.add_handler(CommandHandler("lost", start_lost))
     app.add_handler(CommandHandler("cancel", cancel))
+    app.add_handler(CommandHandler("pending", pending_command))
 
     for pattern, callback in CALLBACK_ROUTES:
         app.add_handler(CallbackQueryHandler(callback, pattern=pattern))
@@ -1586,6 +2139,22 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     app.add_error_handler(error_handler)
+
+    # Every minute: publish approved reports that are due, and remind
+    # moderators about reports close to their two-hour deadline.
+    if app.job_queue is None:
+        raise RuntimeError(
+            "The scheduler is not installed. Run: python -m pip install -r requirements.txt"
+        )
+    app.job_queue.run_repeating(
+        run_schedule, interval=SCHEDULER_INTERVAL_SECONDS, first=5, name="schedule"
+    )
+
+    if not MODERATOR_IDS:
+        logger.warning(
+            "ADMIN_USER_IDS is empty: reports are approved automatically "
+            "(the publishing schedule still applies)."
+        )
 
     print("Lost & Found bot is running...")
     app.run_polling()
