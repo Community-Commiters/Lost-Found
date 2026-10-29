@@ -173,7 +173,7 @@ def custody_keyboard():
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton(
-                "🤲 I'll keep it with me", callback_data="custody_keep"
+                "I'll keep it with me", callback_data="custody_keep"
             )
         ],
         [
@@ -189,7 +189,7 @@ def keep_warning_keyboard():
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton(
-                "✅ OK, share my contact with the owner",
+                "OK, share my contact with the owner",
                 callback_data="custody_keep_ok",
             )
         ],
@@ -201,7 +201,7 @@ def keep_warning_keyboard():
 
 def share_phone_keyboard():
     return ReplyKeyboardMarkup(
-        [[KeyboardButton("📱 Share my phone number", request_contact=True)]],
+        [[KeyboardButton("Share my phone number", request_contact=True)]],
         resize_keyboard=True,
         one_time_keyboard=True,
     )
@@ -211,7 +211,7 @@ def claim_button(bot_username, item_id):
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton(
-                "🙋 It's mine",
+                "It's mine",
                 url=f"https://t.me/{bot_username}?start={CLAIM_PREFIX}{item_id}",
             )
         ]
@@ -234,7 +234,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await update.message.reply_text(
-        "Welcome to Lost&Found! 🎒\n\n"
+        "Welcome to Lost&Found! \n\n"
         "Report an item you lost or found on campus, "
         "or search for an existing announcement.",
         reply_markup=main_menu(),
@@ -463,13 +463,13 @@ async def custody_choice(
     if user.username:
         context.user_data["contact"] = f"@{user.username}"
         await query.edit_message_text(
-            f"🤲 You're keeping the item. The owner will get your "
+            f"You're keeping the item. The owner will get your "
             f"contact: @{user.username}"
         )
         return await publish_report(update, context)
 
     await query.edit_message_text(
-        "🤲 You're keeping the item.\n\n"
+        "You're keeping the item.\n\n"
         "You don't have a Telegram username, so the owner can't message "
         "you directly. Tap the button below to share your phone number, "
         "or type another way to contact you (max 100 characters)."
@@ -565,7 +565,7 @@ async def publish_report(
             )
             set_channel_message_id(item_id, sent.message_id)
             done_text = (
-                "✅ Your announcement was published!\n\n"
+                "Your announcement was published!\n\n"
                 f"Item: {data['title']}\n\n"
                 "The location"
                 + (" and your contact" if data.get("keeps_item") else "")
@@ -585,7 +585,7 @@ async def publish_report(
             )
             await send_announcement(context.bot, announcement, photo_file_id)
             done_text = (
-                "✅ Your announcement was published!\n\n"
+                "Your announcement was published!\n\n"
                 f"Type: #{kind}\n"
                 f"Item: {data['title']}\n\n"
                 "Use /start to return to the main menu."
@@ -653,7 +653,7 @@ async def handle_claim(
     )
     if item["keeps_item"]:
         text += (
-            "🤲 The finder is keeping the item. Contact them to "
+            "The finder is keeping the item. Contact them to "
             f"arrange the return: {item['contact']}\n\n"
             "Be ready to describe the item to prove it's yours."
         )
@@ -672,7 +672,7 @@ async def handle_claim(
         claimer_name += f" (@{claimer.username})"
 
     notice = (
-        f"🙋 {claimer_name} pressed \"It's mine\" on your #FOUND post: "
+        f"{claimer_name} pressed \"It's mine\" on your #FOUND post: "
         f"{item['title']}\n\n"
     )
     if item["keeps_item"]:
@@ -717,7 +717,7 @@ async def testpost(
         await context.bot.send_message(
             chat_id=CHANNEL_ID,
             text=(
-                "🧪 TEST ANNOUNCEMENT\n\n"
+                "TEST ANNOUNCEMENT\n\n"
                 "#FOUND\n"
                 "Item: Example keys\n"
                 "Location: University library\n"
