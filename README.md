@@ -1,7 +1,7 @@
 
-Lost&Found bot - https://t.me/NewUULostFoundBot
+# Lost&Found bot - https://t.me/NewUULostFoundBot
 
-FOR MacOS
+## FOR MacOS
 
 Copy bot.py and requirements.txt into your existing lost-found-bot folder. Keep your existing .env file. Required entries:
 
