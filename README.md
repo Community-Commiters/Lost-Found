@@ -45,3 +45,4 @@ python bot.py
 
 The bot creates lost_found.db automatically in the same folder.
 
+For testing the posting announcements through Telegram bot read the "Lost&Found Telegram Bot — User Guide.pdf" in repo folder
