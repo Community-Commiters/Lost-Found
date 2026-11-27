@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Using the bot (not a code issue)
+    url: https://t.me/NewUULostFoundBot
+    about: Want to report or find an item? Use the Telegram bot directly.

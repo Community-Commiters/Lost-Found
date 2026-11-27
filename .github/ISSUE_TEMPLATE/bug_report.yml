@@ -1,0 +1,94 @@
+name: Bug report
+description: Something in the Lost&Found bot is not working as expected
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting! Please **do not** paste your `BOT_TOKEN`, `.env` contents,
+        phone numbers, or other people's Telegram IDs/usernames. Blur or remove them in screenshots and logs.
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Where does the problem happen?
+      options:
+        - Found report flow (/found)
+        - Lost report flow (/lost)
+        - Photo upload / skip photo
+        - Location selection
+        - Handoff choice (Student Affairs / direct return)
+        - Contact request or claim
+        - Publishing to channel (schedule, duplicates, failures)
+        - Admin moderation (/pending, removing posts)
+        - Database (lost_found.db)
+        - Setup / running the bot
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: command
+    attributes:
+      label: Command or button used
+      description: The command or button you pressed when the problem started.
+      placeholder: "/found, /lost, /cancel, /pending, ✅ Submit, ..."
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: Describe the problem. Screenshots of the chat are welcome.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect to happen?
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Send /found
+        2. Skip the photo
+        3. Choose a location
+        4. ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or traceback
+      description: Terminal output from `python bot.py`, if any. Remove secrets first.
+      render: shell
+
+  - type: input
+    id: timing
+    attributes:
+      label: When did it happen? (date, time, timezone)
+      description: Useful for publishing-window issues (reports are published 09:00–22:00, otherwise the next day at 09:00).
+      placeholder: "2026-11-27, 23:10, Asia/Tashkent"
+
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, Python version, and `python-telegram-bot` version.
+      placeholder: "macOS 14, Python 3.12, python-telegram-bot 21.6"
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues and this is not a duplicate.
+          required: true
+        - label: I removed tokens, phone numbers, and personal data from everything I pasted.
+          required: true
