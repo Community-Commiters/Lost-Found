@@ -1,0 +1,34 @@
+# Code owners for Lost-Found
+# Owners are requested for review automatically on PRs touching their files.
+# With "Require review from Code Owners" enabled in branch protection,
+# at least one listed owner must approve before merge.
+# Later rules override earlier ones, so the catch-all stays first.
+
+# Fallback for anything not listed below
+* @kmirzoyev5
+
+# Core bot
+bot.py @Mirpolat0922 @kmirzoyev5
+
+# Post creation flow, keyboards, states, helpers
+
+keyboards.py @doniyorbekanorboyev @dilnoza471
+posts.py @doniyorbekanorboyev @dilnoza471
+states.py @doniyorbekanorboyev @dilnoza471
+utils.py @doniyorbekanorboyev @dilnoza471
+
+# Tests and coverage
+/tests/ @ibadlayevam19
+pytest.ini @ibadlayevam19
+.coveragerc @ibadlayevam19
+requirements-dev.txt @ibadlayevam19
+
+# Dependencies
+requirements.txt @ibadlayevam19 @dilnoza471
+
+# Docs
+README.md @kmirzoyev5 @dilnoza471
+*.pdf @kmirzoyev5
+
+# CI, templates, and this file
+/.github/ @kmirzoyev5 @Mirpolat0922
